@@ -1,0 +1,41 @@
+INSERT
+				INTO
+				obj_case_tag(
+					id_tag,
+					case_description,
+					case_status,
+					case_code,
+					case_start_dtime,
+					case_end_dtime,
+					case_start_timestamp,
+					case_end_timestamp,
+					case_lost_amount,
+					case_amount,
+					case_stat_amount,
+					case_count,
+					case_stat_count,
+					case_paid_count,
+					case_stat_paid_count,
+					case_payments_count,
+					case_stat_payments_count
+				)
+				VALUES(
+					$1,
+					$2,
+					$3,
+					$4,
+					$5,
+					$6,
+					to_timestamp($7) AT TIME ZONE 'utc',
+					to_timestamp($8) AT TIME ZONE 'utc',
+					$9,
+					$10,
+					$11,
+					$12,
+					$13,
+					$14,
+					$15,
+					$16,
+					$17
+				)
+				RETURNING id_case

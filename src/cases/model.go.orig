@@ -1,0 +1,528 @@
+package cases
+
+import (
+	"47cases_go_server/src/innotrio"
+	"47cases_go_server/src/innotrio/error"
+	"47cases_go_server/src/data"
+	"time"
+	"47cases_go_server/src/config"
+	"strconv"
+	"47cases_go_server/src/provider"
+	"math"
+)
+
+type Model struct {
+	*innotrio.Model
+	PrvModel *provider.Model
+}
+
+func (self *Model)AddComment(idCase string, message string) (safeerror.ISafeError) {
+	return self.Run("UPDATE obj_case SET case_message = $1 WHERE id_case = $2", message, idCase)
+}
+
+func (self *Model)RefreshCases() (safeerror.ISafeError) {
+	casesTypes := [] string {data.PRV_CASE_CODE_DAY}//, data.SOX_PRV_CASE_CODE_DAY}
+	err := self.Run("TRUNCATE stat_bills")
+	if err != nil {
+		return err
+	}
+	for _, casesType := range casesTypes {
+		//Обновляем расчетные данные
+		err := self.generateDayStat(casesType)
+		if err != nil {
+			return err
+		}
+		//self.Run("TRUNCATE obj_case CASCADE")
+		//Получаем данные для анализа
+		dayStat, err := self.getDayStat(casesType)
+		if err != nil {
+			return err
+		}
+
+		switch casesType {
+		case data.PRV_CASE_CODE_DAY:
+			//Анализируем для QW
+			err = self.analyseQWDayStat(dayStat)
+			break
+		case data.SOX_PRV_CASE_CODE_DAY:
+			//Анализируем для SOX QD
+			err = self.analyseQDDayStat(dayStat)
+			break;
+		}
+		if err != nil {
+			return err
+		}
+
+	}
+
+	println("CASE_REFRESH_DONE")
+	return nil
+}
+
+func (self *Model)generateDayStat(casesType string) (safeerror.ISafeError) {
+	var viewName string
+	var whereProviderLike string
+
+	switch casesType {
+	case data.PRV_CASE_CODE_DAY:
+		viewName = `v_bills_monitor`
+		whereProviderLike = `WHERE id_prv like 'QW%'`
+		break
+	case data.SOX_PRV_CASE_CODE_DAY:
+		viewName = `v_sox_monitor`
+		whereProviderLike = `WHERE id_prv like 'QD%'`
+		break
+	default:
+		return safeerror.NewByCode("WRONG_STAT_TYPE")
+	}
+	err := self.Run(`INSERT INTO stat_bills
+		( id_prv, sbills_currency, sbills_time_code, sbills_all_count, sbills_paid_count, sbills_all_amount, sbills_paid_amount )
+		SELECT id_prv, 643 as bills_currency, to_char( bills_add_date, 'dy' ) sbills_time_code,
+			ROUND( AVG ( all_bills_count )) all_bills_count,
+			ROUND( AVG ( paid_bills_count )) paid_bills_count,
+			ROUND( AVG ( all_bills_amount )) all_bills_amount,
+			ROUND( AVG ( paid_bills_amount )) paid_bills_amount
+		FROM ` + viewName + `
+		WHERE bills_add_date < date_trunc( 'day', now())
+		AND bills_add_date > date_trunc( 'day', now()) - INTERVAL ' 3 month'
+		GROUP BY id_prv, sbills_time_code`) // HAVING AVG ( all_bills_count ) > 0`)
+	if err != nil {
+		return err
+	}
+	//Сгенерированная статистика за последние три дня добавляется в stat_bills_history
+	return self.Run(`DELETE FROM stat_bills_history ` + whereProviderLike + `AND sbills_date >= date_trunc('day', now() - interval '3 days');
+	INSERT INTO stat_bills_history(
+			id_prv,
+			sbills_currency,
+			sbills_date,
+			sbills_all_count,
+			sbills_paid_count,
+			sbills_all_amount,
+			sbills_paid_amount
+		) SELECT
+			id_prv,
+			sbills_currency,
+			date_trunc('day', dd)::timestamp,
+			sbills_all_count,
+			sbills_paid_count,
+			sbills_all_amount,
+			sbills_paid_amount
+		FROM
+			stat_bills INNER JOIN(
+				SELECT dd, to_char(dd, 'dy') AS day_of_week
+				FROM generate_series(now() - INTERVAL '3 days', now(), '1 day'::interval) dd
+			) days ON
+			day_of_week = sbills_time_code ` + whereProviderLike)
+}
+
+func (self *Model)getDayStat(casesType string) (*[]data.PrvDayStat, safeerror.ISafeError) {
+	var items []data.PrvDayStat
+	var viewName string
+	var whereClause string
+
+	switch casesType {
+	case data.PRV_CASE_CODE_DAY:
+		viewName = `v_bills_monitor`
+		whereClause = `( sbills_all_count > 10 OR sbills_all_count is null )
+			AND (all_bills_count < 10 OR all_bills_count < sbills_all_count * 0.2) AND
+<<<<<<< working copy
+			( bills_add_date >= ( date_trunc( 'day' :: TEXT, now()) - '4 days' :: INTERVAL ))`
+			//AND ( bills_add_date <= ( date_trunc( 'day' :: TEXT, now()) - '3 days' :: INTERVAL ))`
+=======
+			( bills_add_date >= ( date_trunc( 'day' :: TEXT, now()) - '3 days' :: INTERVAL ))`
+>>>>>>> destination
+		break
+	case data.SOX_PRV_CASE_CODE_DAY:
+		viewName = `v_sox_monitor`
+		whereClause = `( sbills_all_count > 70 ) AND
+			bills_currency = 643 AND
+			( bills_add_date >= ( date_trunc( 'day' :: TEXT, now()) - '3 days' :: INTERVAL ))`
+		break
+	default:
+		return &items, safeerror.NewByCode("WRONG_STAT_TYPE")
+	}
+
+	err := self.Select(&items,
+		`SELECT DISTINCT bills.id_prv, date_rank, COALESCE(sbills_paid_amount, 0) AS sbills_paid_amount,
+			ROUND( paid_bills_amount ) paid_bills_amount,
+			TO_CHAR( bills_add_date, 'DD-MM-YYYY' ) bills_add_date,
+			EXTRACT ( epoch FROM bills_add_date ) :: INTEGER AS bills_add_timestamp,
+			( EXTRACT ( epoch FROM ( date_trunc( 'day', now()) - bills_add_date )) / 86400 ) AS days_from_now
+		FROM ` + viewName + ` bills
+		LEFT JOIN stat_bills stat ON
+			( bills.id_prv = stat.id_prv AND to_char( bills_add_date, 'dy' ) = sbills_time_code )
+		WHERE ` + whereClause + `
+		ORDER BY id_prv, date_rank`)
+	return &items, err
+}
+
+func (self *Model)GetDatesList() (*[]data.CaseDate, safeerror.ISafeError) {
+	var items []data.CaseDate
+	err := self.Select(&items,
+		`SELECT
+			to_char(dd, 'DD-MM-YYYY') as case_date,
+			COUNT(DISTINCT(qw_cases.id_case)) as qw_cases_count,
+			COUNT(DISTINCT(qd_cases.id_case)) as qd_cases_count,
+			COUNT(DISTINCT(all_cases.id_case)) as all_cases_count
+		FROM generate_series(now() - INTERVAL '3 months', now(), '1 day'::interval) dd
+		LEFT JOIN obj_case AS qw_cases ON qw_cases.id_prv LIKE 'QW%' AND qw_cases.case_status <> 'S' AND qw_cases.case_start_timestamp <= dd AND qw_cases.case_end_timestamp + interval '1 day' >= dd
+		LEFT JOIN obj_case AS qd_cases ON qd_cases.id_prv LIKE 'QD%' AND qd_cases.case_status <> 'S' AND qd_cases.case_start_dtime = to_char(dd, 'DD-MM-YYYY')
+		LEFT JOIN obj_case AS all_cases ON all_cases.case_start_timestamp <= dd AND all_cases.case_end_timestamp + INTERVAL '1 day' >= dd
+		GROUP BY dd
+		HAVING COUNT(DISTINCT(all_cases.id_case)) > 0
+		ORDER BY dd DESC`)
+	return &items, err
+}
+
+func (self *Model)GetCasesByDate(date string, casesType string, returnAll bool) (*[]data.FullPrvCase, safeerror.ISafeError) {
+	var items []data.FullPrvCase
+	statusFilter := ""
+	caseTypeFilter := ""
+
+	switch casesType {
+	case data.PRV_CASE_CODE_DAY:
+		caseTypeFilter = " AND obj_case.id_prv like 'QW%'"
+		break
+	case data.SOX_PRV_CASE_CODE_DAY:
+		caseTypeFilter = " AND obj_case.id_prv like 'QD%'"
+		break
+	case data.ALL_PRV_CASE_CODE_DAY:
+		break
+	default:
+		return &items, safeerror.NewByCode("WRONG_STAT_TYPE")
+	}
+	if (!returnAll) {
+		statusFilter = " AND case_status != 'S' "
+	}
+	err := self.Select(&items,
+		`SELECT
+			id_case,
+			obj_case.id_resolution,
+			spr_resolutions.resolution_name,
+			case_status,
+			obj_case.id_prv,
+			obj_provider.prv_name,
+			obj_provider.prs_manager,
+			case_amount,
+			case_stat_amount,
+			case_lost_amount,
+			case_message,
+			round((((( case_amount :: NUMERIC ) / ( case_stat_amount :: NUMERIC )) * 100 ) - 100 ), 2 ) case_diff,
+			case_description,
+			case_code,
+			case_message,
+			case_start_dtime,
+			case_end_dtime,
+			(1+EXTRACT(epoch FROM(case_end_timestamp-case_start_timestamp))/86400) as case_duration
+			FROM obj_case
+			LEFT JOIN obj_provider
+				ON obj_provider.id_prv = obj_case.id_prv
+			LEFT JOIN spr_resolutions
+				ON obj_case.id_resolution = spr_resolutions.id_resolution
+			WHERE
+				case_start_timestamp <= to_timestamp($1, 'DD-MM-YYYY')::timestamp AND case_end_timestamp >= to_timestamp($1, 'DD-MM-YYYY')::timestamp` + statusFilter + caseTypeFilter + ` ORDER BY case_diff ASC`, date)
+	return &items, err
+}
+
+func (self *Model)analyseQWDayStat(dayStat *[]data.PrvDayStat) (safeerror.ISafeError) {
+	if len(*dayStat) < 1 {
+		return safeerror.NewByCode("NO_DAY_STATS")
+	}
+	curIdPrv := (*dayStat)[0].IdPrv
+	expectedRank := (*dayStat)[0].Rank
+	curPrvInfo, err := self.getPrvInfo(curIdPrv, data.PRV_CASE_CODE_DAY)
+	if err != nil {
+		return err
+	}
+
+	startIdx := 0
+	var curIdx int
+	var stat data.PrvDayStat
+
+	for curIdx, stat = range *dayStat {
+		//следующий провайдер или следующий сегмент по датам
+		if curIdPrv != stat.IdPrv || expectedRank != stat.Rank {
+			if err := self.analyseQWPrvCase(curPrvInfo, (*dayStat)[startIdx:curIdx]); err != nil {
+				return err
+			}
+
+			//если следующий провайдер, то получаем по нему информацию
+			if (curIdPrv != stat.IdPrv) {
+				curIdPrv = stat.IdPrv
+				curPrvInfo, err = self.getPrvInfo(curIdPrv, data.PRV_CASE_CODE_DAY)
+				if err != nil {
+					return err
+				}
+			}
+
+			startIdx = curIdx
+			expectedRank = stat.Rank + 1
+		} else {
+			expectedRank++
+		}
+	}
+
+	return self.analyseQWPrvCase(curPrvInfo, (*dayStat)[startIdx:curIdx])
+}
+
+
+func (self *Model)analyseQDDayStat(dayStat *[]data.PrvDayStat) (safeerror.ISafeError) {
+	if len(*dayStat) < 1 {
+		return safeerror.NewByCode("NO_DAY_STATS")
+	}
+	const ACCURACY = 0.80
+
+	status := ""
+	description := ""
+
+	for _, stat := range *dayStat {
+		//По умолчанию считаем, что все хорошо
+		status = data.PRV_CASE_STATUS_STAT
+		description = data.PRV_CASE_DESCRIPTION_OK
+
+		if stat.PaidBillsAmount < stat.StatPaidBillsAmount * ACCURACY {
+			status = data.PRV_CASE_STATUS_WAITING
+			description = data.PRV_CASE_DESCRIPTION_TOO_LOW
+		} else
+		if stat.PaidBillsAmount > stat.StatPaidBillsAmount * (2 - ACCURACY) {
+			status = data.PRV_CASE_STATUS_WAITING
+			description = data.PRV_CASE_DESCRIPTION_TOO_HIGH
+		}
+
+		var caseLostAmount int64 = int64(stat.PaidBillsAmount - stat.StatPaidBillsAmount)
+		var prvCase data.PrvCase = data.PrvCase{
+			stat.IdPrv,
+			description,
+			data.SOX_PRV_CASE_CODE_DAY,
+			status, stat.BillsAddDate,
+			stat.BillsAddDate,
+			stat.BillsAddTimestamp,
+			stat.BillsAddTimestamp,
+			stat.PaidBillsAmount,
+			stat.StatPaidBillsAmount,
+		}
+		if err := self.createOrUpdateCase(caseLostAmount, stat.DaysFromNow, &prvCase); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+
+/**
+	@dayStat упорядоченный массив с днями одного инцидента
+ */
+func (self *Model)analyseQWPrvCase(prvInfo *data.DbPrvInfo, dayStat []data.PrvDayStat) (safeerror.ISafeError) {
+	caseLength := len(dayStat)
+	if caseLength <= prvInfo.MaxNoTxns {
+		return nil
+	}
+	var item data.PrvDayStat
+	var lastItem data.PrvDayStat
+
+	switch caseLength {
+	case 0:
+		return safeerror.NewByCode("NO_PRV_CASE")
+	case 1:
+		item = dayStat[0]
+		lastItem = dayStat[0]
+		break
+	default:
+		item = dayStat[0]
+		lastItem = dayStat[len(dayStat) - 1];
+		break
+	}
+
+	var paidBillsAmount float32 = 0
+	var statPaidBillsAmount float32 = 0
+	var caseLostAmount float32 = 0
+
+	for _, stat := range dayStat {
+		paidBillsAmount += stat.PaidBillsAmount
+		statPaidBillsAmount += stat.StatPaidBillsAmount
+		caseLostAmount += stat.PaidBillsAmount - stat.StatPaidBillsAmount
+	}
+
+	if statPaidBillsAmount == 0 {
+		return nil;
+	}
+
+	if math.Abs(float64(caseLostAmount)) < data.CASE_LOST_AMOUNT_LOWER_LIMIT {
+		return nil;
+	}
+
+	var prvCase data.PrvCase = data.PrvCase{
+		item.IdPrv,
+		data.PRV_CASE_DESCR_ZERO,
+		data.PRV_CASE_CODE_DAY,
+		data.PRV_CASE_STATUS_WAITING,
+		item.BillsAddDate,
+		lastItem.BillsAddDate,
+		item.BillsAddTimestamp,
+		lastItem.BillsAddTimestamp,
+		paidBillsAmount,
+		statPaidBillsAmount,
+	}
+	if err := self.createOrUpdateCase(int64(caseLostAmount), item.DaysFromNow, &prvCase); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (self *Model)createOrUpdateCase(caseLostAmount int64, daysFromNow int, item *data.PrvCase) (safeerror.ISafeError) {
+	//Убираем старые инциденты
+	if (daysFromNow > 60) {
+		return nil
+	}
+
+	var dbCase *data.DbPrvCase
+<<<<<<< working copy
+	//Выборка пересекающегося (предыдущего) инцидента для данного провайдера, где дата начала инцидента меньше даты начала нового инцидента, а дата конца - больше.
+	err := self.SelectOne(&dbCase, `SELECT
+	id_case, id_prv, case_description, case_code, case_status,
+	case_start_dtime, case_end_dtime, case_amount, case_stat_amount, case_lost_amount,
+	EXTRACT(epoch FROM case_start_timestamp)::INTEGER as case_start_timestamp,
+	EXTRACT(epoch FROM case_end_timestamp + INTERVAL '1 day')::INTEGER as case_end_timestamp
+	FROM obj_case WHERE id_prv = $1 AND case_start_timestamp <= to_timestamp($2) at time zone 'utc' AND case_end_timestamp >= to_timestamp($2) at time zone 'utc' AND case_code = $3`, item.IdPrv, item.StartTimestamp, item.Code)
+=======
+	err := self.SelectOne(&dbCase, "SELECT id_case, case_end_dtime FROM obj_case WHERE id_prv = $1 AND case_start_dtime = $2 AND case_code = $3", item.IdPrv, item.StartDate, item.Code)
+>>>>>>> destination
+
+	if err != nil {
+		return err
+	}
+
+	startTimestamp := time.Unix(item.StartTimestamp - 3600 * config.TIME_ZONE_HOURS, 0)
+	endTimestamp := time.Unix(item.EndTimestamp - 3600 * config.TIME_ZONE_HOURS, 0)
+
+	if dbCase != nil {
+		if (dbCase.EndDate != item.EndDate) {
+			return self.Run("UPDATE obj_case SET case_end_dtime = $1, case_end_timestamp = $2, case_lost_amount = $3 WHERE id_case = $4", item.EndDate, endTimestamp, caseLostAmount, dbCase.IdCase)
+		}else {
+			return nil
+		}
+	} else {
+		return self.Run("INSERT INTO obj_case (id_prv,case_description,case_status,case_code,case_start_dtime,case_end_dtime, case_start_timestamp, case_end_timestamp, case_lost_amount, case_amount, case_stat_amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", item.IdPrv, item.Description, item.Status, item.Code, item.StartDate, item.EndDate, startTimestamp, endTimestamp, caseLostAmount, item.PaidBillsAmount, item.StatPaidBillsAmount)
+
+	}
+	return nil
+}
+
+func (self *Model)GetCasesForProvider(idResolution int, providerId string) (*[]data.FullPrvCase, safeerror.ISafeError) {
+	var items []data.FullPrvCase
+	var whereSql string
+	var caseStatus string
+	if (idResolution < 0) {
+		whereSql = "WHERE id_resolution IS NULL"
+		caseStatus = data.PRV_CASE_STATUS_WAITING
+	} else {
+		whereSql = "WHERE id_resolution = " + strconv.Itoa(idResolution)
+		caseStatus = data.PRV_CASE_STATUS_DONE
+	}
+	whereSql += ` AND id_prv = $1 AND case_status = $2 `
+
+	err := self.Select(&items,
+		`SELECT
+			id_case,
+			case_status,
+			case_amount,
+			case_stat_amount,
+			case_description,
+			case_code,
+			case_message,
+			case_start_dtime,
+			case_end_dtime,
+			EXTRACT(epoch FROM case_start_timestamp)::INTEGER as case_start_timestamp,
+			EXTRACT(epoch FROM case_end_timestamp + INTERVAL '1 day')::INTEGER as case_end_timestamp,
+			(1+EXTRACT(epoch FROM(case_end_timestamp-case_start_timestamp))/86400) as case_duration,
+			round((((( case_amount :: NUMERIC ) / ( case_stat_amount :: NUMERIC )) * 100 ) - 100 ), 2 ) case_diff,
+			id_prv,
+			case_lost_amount,
+			id_resolution
+		FROM obj_case ` + whereSql + `
+		ORDER BY id_prv, case_start_timestamp DESC`, providerId, caseStatus)
+
+	return &items, err
+}
+
+func (self *Model)GetStatBillsHistory(idPrv string, dateStart int64, dateEnd int64) (*[]data.StatBillsHistory, safeerror.ISafeError) {
+	var items []data.StatBillsHistory
+	err := self.Select(&items,
+		`SELECT
+			id_stat_bills_history,
+			id_prv,
+			sbills_currency,
+			to_char(sbills_date, 'DD-MM-YYYY') AS sbills_date,
+			sbills_all_count,
+			sbills_paid_count,
+			sbills_all_amount,
+			sbills_paid_amount,
+			EXTRACT(epoch FROM sbills_date)::INTEGER as sbills_date_timestamp
+		FROM stat_bills_history
+		WHERE id_prv = $1 AND sbills_date >= to_timestamp($2) at time zone 'utc' AND sbills_date < to_timestamp($3) at time zone 'utc'
+		ORDER BY sbills_date DESC`, idPrv, dateStart, dateEnd)
+	return &items, err
+}
+
+func (self *Model)GetProvidersWithCases(idResolution int, providerType string) (*[]*data.ProviderForCases, safeerror.ISafeError) {
+	var whereSql string
+	var caseStatus string
+	if (idResolution < 0) {
+		whereSql = "WHERE id_resolution is null"
+		caseStatus = data.PRV_CASE_STATUS_WAITING
+	} else {
+		whereSql = "WHERE id_resolution = " + strconv.Itoa(idResolution)
+		caseStatus = data.PRV_CASE_STATUS_DONE
+	}
+	switch providerType {
+	case data.SOX_PRV_CASE_CODE_DAY:
+		whereSql += ` AND id_prv like 'QD%'`
+		break;
+	case data.PRV_CASE_CODE_DAY:
+		whereSql += ` AND id_prv like 'QW%'`
+		break;
+	default:
+		break;
+	}
+	var items []*data.ProviderForCases
+	err := self.Select(&items, `SELECT prv.id_prv, prv.prv_name, prv.prv_url, prv.prs_manager, prv.prv_type,
+									prv.prs_state, prv.accept_status, prv.shema, prv.prv_add_timestamp, prv.contract_date_from,
+									prv.prv_first_txn_timestamp, prv.prv_last_txn_timestamp, prv.agt_id, prv.reject_cause,
+									prv.agregator, prv.prv_global_name, prv.prv_merch_name, lost_amount::INTEGER, cases_count
+								FROM obj_provider prv
+								INNER JOIN ( SELECT id_prv, COUNT (id_case) cases_count, SUM ( case_lost_amount ) lost_amount
+									 FROM obj_case ` + whereSql + ` AND case_status = $1
+									GROUP BY id_prv ) cases
+								ON prv.id_prv = cases.id_prv ORDER BY lost_amount ASC`, caseStatus)
+
+	return &items, err
+}
+
+func (self *Model)getPrvInfo(idPrv string, prvType string) (*data.DbPrvInfo, safeerror.ISafeError) {
+	var prvInfo *data.DbPrvInfo
+
+	err := self.SelectOne(&prvInfo, "SELECT id_prv, prv_max_no_txns FROM sys_prv_info WHERE id_prv = $1 ", idPrv)
+	if err != nil {
+		return nil, err
+	}
+
+	if prvInfo == nil {
+		prvInfo = data.NewDbPrvInfo(idPrv)
+	}
+
+	var avg int64;
+
+	switch prvType {
+	case data.PRV_CASE_CODE_DAY:
+		avg, err = self.SelectInt("SELECT COALESCE(ROUND( AVG ( paid_bills_amount ))::INTEGER, 0) FROM v_bills_monitor bills, obj_provider prv WHERE prv.id_prv = bills.id_prv AND prv.id_prv = $1 AND bills_add_date < prv_last_txn_timestamp", idPrv)
+		break;
+	case data.SOX_PRV_CASE_CODE_DAY:
+		avg, err = self.SelectInt("SELECT COALESCE(ROUND( AVG ( paid_bills_amount ))::INTEGER, 0) FROM v_sox_monitor bills, obj_provider prv WHERE prv.id_prv = bills.id_prv AND prv.id_prv = $1 AND bills_add_date < prv_last_txn_timestamp", idPrv)
+		break;
+
+	}
+
+	prvInfo.AvgPaidAmount = avg
+
+	return prvInfo, err
+}

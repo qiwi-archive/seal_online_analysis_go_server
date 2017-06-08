@@ -1,0 +1,495 @@
+package cases
+
+import (
+	"47cases_go_server/src/innotrio"
+	"47cases_go_server/src/innotrio/error"
+	"47cases_go_server/src/data"
+	"math"
+	"strings"
+)
+
+type CalculationModel struct {
+	*innotrio.Model
+}
+
+func (self *CalculationModel)RefreshCases() (safeerror.ISafeError) {
+	casesTypes := [] string {data.PRV_CASE_CODE_DAY, data.SOX_PRV_CASE_CODE_DAY}
+	err := self.Run("TRUNCATE stat_bills")
+	if err != nil {
+		return err
+	}
+	for _, casesType := range casesTypes {
+		//Обновляем расчетные данные
+		err := self.generateDayStat(casesType)
+		if err != nil {
+			return err
+		}
+		//self.Run("TRUNCATE obj_case CASCADE")
+		//Получаем данные для анализа
+		dayStat, err := self.getDayStat(casesType)
+		if err != nil {
+			return err
+		}
+
+		//Анализируем статистику по дням и создаем однодневные инциденты
+		err = self.generateCases(dayStat, casesType)
+		if err != nil {
+			return err
+		}
+
+		//Объединяем инциденты
+		if (casesType == data.PRV_CASE_CODE_DAY) {
+			err = self.associateCases(casesType)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	//Гарантирует корректность сумм статов в родительских инцидентах
+	err = self.refreshParentCasesStats()
+	if err != nil {
+		return err
+	}
+
+	println("CASE_REFRESH_DONE")
+	return nil
+}
+
+func (self *CalculationModel)generateDayStat(casesType string) (safeerror.ISafeError) {
+	var whereProviderLike string
+	var tagCode string
+	var flowCodeFilter string
+
+	switch casesType {
+	case data.PRV_CASE_CODE_DAY:
+		tagCode = `'DAY_MONITOR'`
+		flowCodeFilter = `sys_pay_flow.pflow_code IN ('QW_DAYS', 'QW_PUSH_DAYS') `
+		whereProviderLike = `WHERE id_prv like 'QW%'`
+		break
+	case data.SOX_PRV_CASE_CODE_DAY:
+		tagCode = `'SOX_MONITOR'`
+		flowCodeFilter = `sys_pay_flow.pflow_code = 'QD_SOX' `
+		whereProviderLike = `WHERE id_prv like 'QD%'`
+		break
+	default:
+		return safeerror.NewByCode("WRONG_STAT_TYPE")
+	}
+	err := self.Run(`WITH
+		providers AS (SELECT id_prv FROM v_providers WHERE v_providers.tag_code = ` + tagCode + `),
+		all_sums AS (SELECT id_prv, bills_add_timestamp, sum(bills_count) AS bills_count, sum(bills_amount) AS bills_amount
+			FROM sys_pay_flow
+			INNER JOIN aggr_bills
+			ON aggr_bills.pflow_code = sys_pay_flow.pflow_code
+			 	AND aggr_bills.id_pay_flow = sys_pay_flow.id_pay_flow
+				AND bills_add_timestamp > date_trunc( 'day', now()) - INTERVAL ' 3 month 7 days'
+			WHERE ` + flowCodeFilter + `
+			GROUP BY id_prv, bills_add_timestamp),
+		paid_sums AS (SELECT id_prv, bills_add_timestamp, sum(bills_count) AS bills_count, sum(bills_amount) AS bills_amount
+			FROM sys_pay_flow
+			INNER JOIN aggr_bills
+			ON aggr_bills.pflow_code = sys_pay_flow.pflow_code
+			 	AND aggr_bills.id_pay_flow = sys_pay_flow.id_pay_flow
+				AND bills_add_timestamp > date_trunc( 'day', now()) - INTERVAL ' 3 month 7 days'
+			WHERE ` + flowCodeFilter + ` AND sys_pay_flow.pflow_paid = 1
+			GROUP BY id_prv, bills_add_timestamp)
+		INSERT INTO stat_bills
+		( id_prv, sbills_currency, sbills_time_code, sbills_all_count, sbills_paid_count, sbills_all_amount, sbills_paid_amount )
+		SELECT providers.id_prv, 643 as bills_currency, to_char( all_sums.bills_add_timestamp, 'dy' ) sbills_time_code,
+			round(avg(all_sums.bills_count)) all_bills_count,
+			round(avg(paid_sums.bills_count)) paid_bills_count,
+			round(avg(all_sums.bills_amount)) all_bills_amount,
+			round(avg(paid_sums.bills_amount)) paid_bills_amount
+		FROM
+		providers, all_sums, paid_sums
+		WHERE all_sums.id_prv = providers.id_prv
+		AND paid_sums.id_prv =  all_sums.id_prv AND paid_sums.bills_add_timestamp = all_sums.bills_add_timestamp
+		GROUP BY providers.id_prv, to_char( all_sums.bills_add_timestamp, 'dy' )`) // HAVING AVG ( all_bills_count ) > 0`)
+	if err != nil {
+		return err
+	}
+	//Сгенерированная статистика за последние три дня добавляется в stat_bills_history
+	return self.Run(`DELETE FROM stat_bills_history ` + whereProviderLike + `AND sbills_date >= date_trunc('day', now() - interval '7 days');
+	INSERT INTO stat_bills_history(
+			id_prv,
+			sbills_currency,
+			sbills_date,
+			sbills_all_count,
+			sbills_paid_count,
+			sbills_all_amount,
+			sbills_paid_amount
+		) SELECT
+			id_prv,
+			sbills_currency,
+			date_trunc('day', dd)::timestamp,
+			sbills_all_count,
+			sbills_paid_count,
+			sbills_all_amount,
+			sbills_paid_amount
+		FROM
+			stat_bills INNER JOIN(
+				SELECT dd, to_char(dd, 'dy') AS day_of_week
+				FROM generate_series(now() - INTERVAL '7 days', now(), '1 day'::interval) dd
+			) days ON
+			day_of_week = sbills_time_code ` + whereProviderLike)
+}
+
+func (self *CalculationModel)getDayStat(casesType string) (*[]data.PrvDayStat, safeerror.ISafeError) {
+	var items []data.PrvDayStat
+	var flowCodeFilter string
+	var whereClause string
+
+	switch casesType {
+	case data.PRV_CASE_CODE_DAY:
+		flowCodeFilter = `sys_pay_flow.pflow_code IN ('QW_DAYS', 'QW_PUSH_DAYS') `
+		whereClause = `tag_code = 'DAY_MONITOR' AND ( sbills_all_count > 10 OR sbills_all_count is null )
+			AND (bills_count < 10 OR bills_count < sbills_paid_count * 0.2) AND
+			( bills_add_timestamp >= ( date_trunc( 'day' :: TEXT, now()) - '7 days' :: INTERVAL ))`
+		break
+	case data.SOX_PRV_CASE_CODE_DAY:
+		flowCodeFilter = `sys_pay_flow.pflow_code = 'QD_SOX' `
+		whereClause = `tag_code = 'SOX_MONITOR' AND ( sbills_all_count > 70 ) AND
+			( bills_add_timestamp >= ( date_trunc( 'day' :: TEXT, now()) - '7 days' :: INTERVAL ))`
+		break
+	default:
+		return &items, safeerror.NewByCode("WRONG_STAT_TYPE")
+	}
+
+	err := self.Select(&items,
+		`WITH
+		paid_sums AS (SELECT id_prv, bills_add_timestamp, sum(bills_count) AS bills_count, sum(bills_amount) AS bills_amount
+		FROM sys_pay_flow
+		INNER JOIN aggr_bills ON
+		aggr_bills.pflow_code = sys_pay_flow.pflow_code
+		AND aggr_bills.id_pay_flow = sys_pay_flow.id_pay_flow
+		AND bills_add_timestamp > date_trunc('day', now()) - '7 days'::INTERVAL
+		WHERE ` + flowCodeFilter + ` AND pflow_paid = 1
+		GROUP BY id_prv, bills_add_timestamp
+		)
+		SELECT v_providers.id_prv,
+			ROUND(sbills_paid_amount) sbills_paid_amount,
+			ROUND(bills_amount) paid_bills_amount,
+			TO_CHAR( bills_add_timestamp, 'DD-MM-YYYY' ) bills_add_date,
+			EXTRACT ( epoch FROM bills_add_timestamp )::INTEGER AS bills_add_timestamp,
+			EXTRACT ( DAY FROM now() - bills_add_timestamp ) AS days_from_now
+		FROM v_providers, paid_sums, stat_bills
+		WHERE
+		paid_sums.id_prv = v_providers.id_prv
+		AND stat_bills.id_prv = v_providers.id_prv
+		AND to_char( paid_sums.bills_add_timestamp, 'dy' ) = stat_bills.sbills_time_code
+		AND ` + whereClause + `
+		ORDER BY v_providers.id_prv, bills_add_timestamp`)
+	return &items, err
+}
+
+
+func (self *CalculationModel)generateCases(dayStat *[]data.PrvDayStat, casesType string) (safeerror.ISafeError) {
+	if len(*dayStat) < 1 {
+		return safeerror.NewByCode("NO_DAY_STATS")
+	}
+	const ACCURACY = 0.80
+
+	status := ""
+	description := ""
+
+	for _, stat := range *dayStat {
+		//По умолчанию считаем, что все хорошо
+		status = data.PRV_CASE_STATUS_STAT
+		description = data.PRV_CASE_DESCRIPTION_OK
+
+		if stat.PaidBillsAmount < stat.StatPaidBillsAmount * ACCURACY {
+			status = data.PRV_CASE_STATUS_WAITING
+			description = data.PRV_CASE_DESCRIPTION_TOO_LOW
+		} else
+		if stat.PaidBillsAmount > stat.StatPaidBillsAmount * (2 - ACCURACY) {
+			status = data.PRV_CASE_STATUS_WAITING
+			description = data.PRV_CASE_DESCRIPTION_TOO_HIGH
+		}
+		var caseLostAmount int64 = int64(stat.PaidBillsAmount - stat.StatPaidBillsAmount)
+
+		switch casesType {
+		case data.PRV_CASE_CODE_DAY:
+			if stat.StatPaidBillsAmount == 0 {
+				continue
+			}
+			if math.Abs(float64(caseLostAmount)) < data.CASE_LOST_AMOUNT_LOWER_LIMIT {
+				status = data.PRV_CASE_STATUS_STAT
+			}
+			break
+		case data.SOX_PRV_CASE_CODE_DAY:
+			break
+		default:
+			return safeerror.NewByCode("WRONG_STAT_TYPE")
+		}
+
+		var prvCase data.PrvCase = data.PrvCase{
+			stat.IdPrv,
+			description,
+			casesType,
+			status, stat.BillsAddDate,
+			stat.BillsAddDate,
+			stat.BillsAddTimestamp,
+			stat.BillsAddTimestamp,
+			stat.PaidBillsAmount,
+			stat.StatPaidBillsAmount,
+		}
+		if err := self.createCaseIfNotExist(caseLostAmount, stat.DaysFromNow, &prvCase); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (self *CalculationModel)createCaseIfNotExist(caseLostAmount int64, daysFromNow int, item *data.PrvCase) (safeerror.ISafeError) {
+	//Убираем старые инциденты
+	if (daysFromNow > 60) {
+		return nil
+	}
+
+	var dbCase *data.DbPrvCase
+	err := self.SelectOne(&dbCase, `SELECT id_case, case_end_dtime FROM obj_case WHERE id_prv = $1 AND case_start_dtime = $2 AND case_code = $3 AND case_start_dtime = case_end_dtime`, item.IdPrv, item.StartDate, item.Code)
+
+	if err != nil {
+		return err
+	}
+
+	if dbCase == nil {
+		return self.Run("INSERT INTO obj_case (id_prv,case_description,case_status,case_code,case_start_dtime,case_end_dtime, case_start_timestamp, case_end_timestamp, case_lost_amount, case_amount, case_stat_amount) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7) at time zone 'utc',to_timestamp($8) at time zone 'utc',$9,$10,$11)", item.IdPrv, item.Description, item.Status, item.Code, item.StartDate, item.EndDate, item.StartTimestamp, item.EndTimestamp, caseLostAmount, item.Amount, item.StatAmount)
+
+	}
+	return nil
+}
+
+func (self *CalculationModel)associateCases(casesType string) (safeerror.ISafeError) {
+	var items []data.FullPrvCase
+	caseTypeFilter := ""
+
+	switch casesType {
+	case data.PRV_CASE_CODE_DAY:
+		caseTypeFilter = " AND obj_case.id_prv like 'QW%'"
+		break
+	case data.SOX_PRV_CASE_CODE_DAY:
+		caseTypeFilter = " AND obj_case.id_prv like 'QD%'"
+		break
+	case data.ALL_PRV_CASE_CODE_DAY:
+		break
+	default:
+		return safeerror.NewByCode("WRONG_STAT_TYPE")
+	}
+	//Выбираем только что сгенерированные инциденты и родительские инциденты, которые заканчиваются в последние 7 дней
+	//При этом первыми строками будут родительские инциденты (длятся несколько дней)
+	//Если родительский инцидент существует, то в нем уже учтены данные из дневных инцидентов, указывающих на него
+	err := self.Select(&items,
+		`SELECT id_case,
+			obj_case.id_resolution,
+			spr_resolutions.resolution_name,
+			case_status,
+			obj_case.id_prv,
+			obj_provider.prv_name,
+			obj_provider.prs_manager,
+			case_amount,
+			case_stat_amount,
+			case_lost_amount,
+			case_message,
+			round((((( case_amount :: NUMERIC ) / ( case_stat_amount :: NUMERIC )) * 100 ) - 100 ), 2 ) case_diff,
+			case_description,
+			case_code,
+			case_message,
+			case_start_dtime,
+			case_end_dtime,
+			EXTRACT(epoch FROM(case_start_timestamp))::INTEGER AS case_start_timestamp,
+			EXTRACT(epoch FROM(case_end_timestamp))::INTEGER AS case_end_timestamp,
+			(1+EXTRACT(epoch FROM(case_end_timestamp-case_start_timestamp))/86400) as case_duration
+			FROM obj_case
+			LEFT JOIN obj_provider
+				ON obj_provider.id_prv = obj_case.id_prv
+			LEFT JOIN spr_resolutions
+				ON obj_case.id_resolution = spr_resolutions.id_resolution
+			WHERE case_end_timestamp >= date_trunc('day', now())::timestamp - interval '7 days'
+			AND case_parent_id IS NULL
+			` + caseTypeFilter + `
+			 ORDER BY case_duration DESC, id_prv, case_end_timestamp ASC`)
+	if err != nil {
+		return err
+	}
+
+	parentCases := []data.FullPrvCase{}
+
+	var findParentCase = func(idProvider string, parentCases []data.FullPrvCase) (data.FullPrvCase) {
+		var result data.FullPrvCase
+		for _, parentCase := range parentCases {
+			if (parentCase.IdPrv == idProvider) {
+				result = parentCase
+				break
+			}
+		}
+		return result
+	}
+
+	var currentIdProvider string
+	var startIndex int = -1
+	for currentIndex, dbCase := range items {
+		//Сначала идут все "родительские" - многодневные
+		if dbCase.Duration > 1 {
+			parentCases = append(parentCases, dbCase)
+		} else {
+		// затем все однодневные
+			if dbCase.IdPrv != currentIdProvider {
+				if currentIdProvider != `` && startIndex != -1 {
+					self.createOrUpdateParentCase(items[startIndex:currentIndex],
+						findParentCase(currentIdProvider, parentCases))
+				}
+				//Пошел следующий провайдер
+				startIndex = currentIndex
+				currentIdProvider = dbCase.IdPrv
+			}
+		}
+	}
+
+	return self.createOrUpdateParentCase(items[startIndex:len(items)], findParentCase(currentIdProvider, parentCases))
+}
+
+func (self *CalculationModel)createOrUpdateParentCase(dayCases []data.FullPrvCase, parentCase data.FullPrvCase) (safeerror.ISafeError) {
+	const ACCURACY = 0.80
+	var dbParentCase data.DbPrvCase
+	var paidBillsAmount float32 = parentCase.Amount
+	var statPaidBillsAmount float32 = parentCase.StatAmount
+	var caseLostAmount float32 = float32(parentCase.LostAmount)
+	var description string
+	var status string
+	var casesLength int = len(dayCases)
+	if casesLength == 0 {
+		return safeerror.NewByCode("NO_DAY_CASES")
+	}
+
+	var casesIds []string = []string{}
+	var firstDayCase data.FullPrvCase = dayCases[0]
+	var lastDayCase data.FullPrvCase = dayCases[casesLength - 1];
+
+	for _, dayCase := range dayCases {
+		casesIds = append(casesIds, dayCase.Id)
+		paidBillsAmount += dayCase.Amount
+		statPaidBillsAmount += dayCase.StatAmount
+		caseLostAmount += dayCase.Amount - dayCase.StatAmount
+	}
+
+	if &parentCase == nil || parentCase.Id == `` {
+		if casesLength == 1 {
+			return nil
+		}
+
+		if statPaidBillsAmount == 0 {
+			return nil;
+		}
+
+		if math.Abs(float64(caseLostAmount)) < data.CASE_LOST_AMOUNT_LOWER_LIMIT {
+			return nil;
+		}
+
+		status = `W`
+		if paidBillsAmount == 0 {
+			description = data.PRV_CASE_DESCRIPTION_ZERO
+		} else if paidBillsAmount < statPaidBillsAmount * ACCURACY {
+			description = data.PRV_CASE_DESCRIPTION_TOO_LOW
+		} else if paidBillsAmount > statPaidBillsAmount * (2 - ACCURACY) {
+			description = data.PRV_CASE_DESCRIPTION_TOO_HIGH
+		}
+		err := self.SelectOne(&dbParentCase, `INSERT
+				INTO
+				obj_case(
+					id_prv,
+					case_description,
+					case_status,
+					case_code,
+					case_start_dtime,
+					case_end_dtime,
+					case_start_timestamp,
+					case_end_timestamp,
+					case_lost_amount,
+					case_amount,
+					case_stat_amount
+				)
+				VALUES(
+					$1,
+					$2,
+					$3,
+					$4,
+					$5,
+					$6,
+					to_timestamp($7) AT TIME ZONE 'utc',
+					to_timestamp($8) AT TIME ZONE 'utc',
+					$9,
+					$10,
+					$11
+				)
+				RETURNING id_case`,
+			lastDayCase.IdPrv, description, status, lastDayCase.Code, firstDayCase.StartDate, lastDayCase.EndDate, firstDayCase.StartTimestamp, lastDayCase.EndTimestamp, int64(caseLostAmount), paidBillsAmount, statPaidBillsAmount)
+		if err != nil {
+			return err
+		}
+	} else {
+		if parentCase.Status == `D` {
+			status = `D`
+		} else {
+			status = `W`
+		}
+		dbParentCase = data.DbPrvCase{parentCase.Id, ``}
+		err := self.Run(`UPDATE obj_case SET
+				case_description = $2,
+				case_end_dtime = $3,
+				case_end_timestamp = to_timestamp($4) AT TIME ZONE 'utc',
+				case_lost_amount = case_lost_amount + $5,
+				case_amount = case_amount + $6,
+				case_stat_amount = case_stat_amount + $7,
+				case_status = $8
+				WHERE
+				id_case = $1
+				`, parentCase.Id, description, lastDayCase.EndDate, lastDayCase.EndTimestamp, int64(caseLostAmount), paidBillsAmount, statPaidBillsAmount, status)
+		if err != nil {
+			return err
+		}
+	}
+
+	if &dbParentCase == nil {
+		return safeerror.NewByCode(`COULD NOT CREATE OR UPDATE PARENT CASE`)
+	}
+
+	err := self.Run(`UPDATE obj_case SET
+				case_parent_id = $1
+				WHERE
+				id_case IN (` + strings.Join(casesIds, `,`) + `)`, dbParentCase.IdCase)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (self *CalculationModel)refreshParentCasesStats() (safeerror.ISafeError) {
+	err := self.Run(`
+	WITH sums AS(
+	    SELECT
+		SUM(case_lost_amount) AS lost_amount_sum,
+		SUM(case_amount) AS amount_sum,
+		SUM(case_stat_amount) AS stat_amount_sum,
+		case_parent_id
+	    FROM
+		obj_case
+	    WHERE
+		case_parent_id IS NOT NULL
+	    GROUP BY
+		case_parent_id
+	) UPDATE
+	    obj_case
+	SET
+	    case_lost_amount = sums.lost_amount_sum,
+	    case_amount = sums.amount_sum,
+	    case_stat_amount = sums.stat_amount_sum
+	FROM
+	    sums
+	WHERE
+	    sums.case_parent_id = obj_case.id_case
+	    AND obj_case.case_parent_id IS NULL
+	    AND obj_case.case_end_timestamp - obj_case.case_start_timestamp >= INTERVAL '1 day' returning *;`)
+	return err
+}

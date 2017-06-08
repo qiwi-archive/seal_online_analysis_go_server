@@ -1,0 +1,176 @@
+package data
+import (
+	"gopkg.in/guregu/null.v2/zero"
+	"time"
+	"gopkg.in/guregu/null.v2"
+)
+
+type Tag struct {
+	Id  int `db:"id_tag"`
+	Name zero.String `db:"tag_name"`
+	Code zero.String `db:"tag_code"`
+	Count int `db:"tag_count"`
+	IsReportColumn bool `db:"tag_is_report_column"`
+}
+
+type CaseDate struct {
+	Date zero.String `db:"case_start_dtime"`
+	PrvCount zero.String `db:"prvs_count"`
+}
+
+type CaseReport struct {
+	Day zero.String `db:"case_start_dtime"`
+	PrvCount zero.String `db:"prvs_count"`
+}
+
+type Report struct {
+	Id  int `db:"id_report"`
+	Name string `db:"report_name"`
+	Code string `db:"report_code"`
+	Description string `db:"report_description"`
+	HasComments bool `db:"report_has_comments"`
+	UniqueColName zero.String `db:"report_sql_uniq_col"`
+}
+
+type Provider struct {
+	Id zero.String `db:"id_prv"`
+	Name zero.String `db:"prv_name"`
+	AgtName zero.String `db:"agt_name"`
+	Url zero.String `db:"prv_url"`
+	Manager zero.String `db:"prs_manager"`
+	Type zero.String `db:"prv_type"`
+	PrsState zero.String `db:"prs_state"`
+	AcceptStatus zero.String `db:"accept_status"`
+	Shema zero.String `db:"shema"`
+	AddDate *time.Time `db:"prv_add_timestamp"`
+	ContractDateFrom zero.String `db:"contract_date_from"`
+	FirstTxnDate *time.Time `db:"prv_first_txn_timestamp"`
+	LastTxnDate *time.Time `db:"prv_last_txn_timestamp"`
+	AgtId zero.String `db:"agt_id"`
+	RejectCause zero.String `db:"reject_cause"`
+	Agregator zero.String `db:"agregator"`
+	GlobalName zero.String `db:"prv_global_name"`
+	MerchName zero.String `db:"prv_merch_name"`
+}
+
+type ProviderDay struct {
+	Provider
+	Bills *[]GraphBill
+}
+
+type ProviderForCases struct {
+	ProviderDay
+	LostAmount int64 `db:"lost_amount"`
+}
+
+type Provider5M struct {
+	ProviderDay
+	Bills5m *[]GraphBill
+}
+
+/*
+type Bill struct {
+	AddDate int `db:"bills_add_timestamp"`
+	Currency zero.String `db:"bills_currency"`
+	//ArePaid zero.Bool `db:"bills_are_paid"`
+	AllCount int `db:"all_bills_count"`
+	PaidCount int `db:"paid_bills_count"`
+	AllAmount float32 `db:"all_bills_amount"`
+	PaidAmount float32 `db:"paid_bills_amount"`
+	Conversion float32 `db:"bills_conversion"`
+}*/
+
+type GraphBill struct {
+	AddDate int `db:"bills_add_timestamp"`
+	AllCount int `db:"all_bills_count"`
+	PaidAmount float32 `db:"paid_bills_amount"`
+	Conversion null.Float `db:"bills_conversion"`
+}
+
+const (
+	PRV_CASE_DESCR_ZERO = "Нет транзакций"
+	PRV_CASE_CODE_DAY = "PRV_DAY"
+	SOX_PRV_CASE_CODE_DAY = "PRV_SOX_DAY"
+	ALL_PRV_CASE_CODE_DAY = "ALL_PRV_DAY"
+)
+
+type FullPrvCase struct {
+	PrvCase
+	Id  string `db:"id_case"`
+	Message zero.String `db:"case_message"`
+	Status string `db:"case_status"`
+	Duration int `db:"case_duration"`
+	LostAmount int64 `db:"case_lost_amount"`
+	IdResolution null.String `db:"id_resolution"`
+	Amount int64 `db:"case_amount"`
+	StatAmount int64 `db:"case_stat_amount"`
+}
+
+type PrvCaseItem struct {
+	Id  string `db:"id_case"`
+	IdPrv  string `db:"id_prv"`
+	PrvName zero.String `db:"prv_name"`
+	PrvManager zero.String `db:"prs_manager"`
+	RefNumber zero.String `db:"ref_number"`
+	Amount int64 `db:"case_amount"`
+	StatAmount int64 `db:"case_stat_amount"`
+	LostAmount int64 `db:"case_lost_amount"`
+	Diff float32 `db:"case_diff"`
+	Message zero.String `db:"case_message"`
+	Status string `db:"case_status"`
+	IdResolution null.String `db:"id_resolution"`
+	ResolutionName null.String `db:"resolution_name"`
+}
+
+const (
+	//Ожидает решения пользователя
+	PRV_CASE_STATUS_WAITING = "W"
+	//Все хорошо, просто записали данные для статистики
+	PRV_CASE_STATUS_STAT = "S"
+	//Менеджер отреагировал
+	PRV_CASE_STATUS_DONE = "D"
+
+	PRV_CASE_DESCRIPTION_OK = "Показатели в норме"
+	PRV_CASE_DESCRIPTION_TOO_HIGH = "Превышение на 15%"
+	PRV_CASE_DESCRIPTION_TOO_LOW = "Ниже ожиданий на 15%"
+)
+
+
+type PrvCase struct {
+	IdPrv  string `db:"id_prv"`
+	Description string `db:"case_description"`
+	Code string `db:"case_code"`
+	Status string `db:"case_status"`
+	StartDate string `db:"case_start_dtime"`
+	EndDate string `db:"case_end_dtime"`
+	StartTimestamp int64 `db:"case_start_timestamp"`
+	EndTimestamp int64 `db:"case_end_timestamp"`
+	PaidBillsAmount float32 `db:"case_amount"`
+	StatPaidBillsAmount float32 `db:"case_stat_amount"`
+}
+
+<<<<<<< local
+=======
+type PrvCase struct {
+	IdPrv  string `db:"id_prv"`
+	Description string `db:"case_description"`
+	Code string `db:"case_code"`
+	StartDate string `db:"case_start_dtime"`
+	EndDate string `db:"case_end_dtime"`
+	StartTimestamp int64 `db:"case_start_timestamp"`
+	EndTimestamp int64 `db:"case_end_timestamp"`
+}
+
+>>>>>>> other
+type CaseResolution struct {
+	Id  string `db:"id_resolution"`
+	Name string `db:"resolution_name"`
+	Style zero.String `db:"resolution_style"`
+}
+
+type CasesInfo struct {
+	Providers  *[]*ProviderForCases
+	Cases  *[]FullPrvCase
+}
+
+

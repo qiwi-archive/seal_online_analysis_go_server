@@ -1,0 +1,22 @@
+package config
+import "github.com/gin-gonic/gin"
+
+const (
+	DB_USER = "user"
+	DB_PASS = "password=123456"
+	DB_HOST = "db.host.ru"
+	DB_PORT = "5432"
+	DB_NAME = "db_name"
+	
+	GIN_RELEASE_MODE = gin.ReleaseMode
+
+	API_HOST                = "http://localhost:2211"
+	BASE_API_PREFIX         = "/api_analit/"
+	API_PREFIX              = "/api"
+	API_BOT_PREFIX          = "/api_bot"
+	TIME_ZONE_HOURS         = 3
+	ORACLE_API_REQUEST_CODE = "*"
+	ADMIN_REQUEST_CODE      = "*"
+
+	CRON_ENABLED = GIN_RELEASE_MODE == gin.ReleaseMode
+)
